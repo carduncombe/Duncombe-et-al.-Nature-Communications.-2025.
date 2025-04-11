@@ -1,0 +1,321 @@
+---
+title: "RNA-seq-data-cleaning"
+author: "Caroline_Duncombe"
+date: '2022-04-26'
+output: html_document
+---
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r libraries}
+
+library(tidyverse)
+library(BIGpicture)
+library(RNAetc)
+library(scales)
+library(ggrepel)
+library(patchwork)
+library(limma)
+library(edgeR)
+
+```
+
+#Sample and library metadata
+```{r Combing metadata}
+#Pull the clincal characteristics data
+phenotype_meta <- read_csv("data_raw/phenotype_data.csv") %>%
+#format any variables that need to be factors. Question- what would need to be a factor?
+  as.data.frame(unclass(DF),stringsAsFactors=TRUE) %>%
+  mutate(ID = as.character(ID))
+
+#Pull the flagstat meta data document
+flagstat <- read_tsv("data_raw/metrics/combined_flagstat.tsv")
+picard <- read_tsv("data_raw/metrics/combined_picard.tsv")
+
+#Combine into a single file. 
+meta <- full_join(phenotype_meta, flagstat, by = "libID") %>% full_join(picard, by = "libID")
+
+```
+
+# Create Counts Table
+```{r counts table}
+
+count <- read_tsv("data_raw/counts/combined_feature_counts.tsv")
+
+```
+
+# Quality Filter data
+### filter poor-quality libraries
+
+I will assess sample quality using several metrics from samtools flagstat. Our standard assessment includes:
+• Pass-filter sequences (to.align)
+• Percent alignment (pass-filter alignments/sequences, align.filtered/to.align) 
+• Median coefficient of variation (CV) of coverage (MEDIAN_CV_COVERAGE)
+
+Ideal libraries have high total sequences, high percent alignment, and low CV coverage. Cutoffs for sample removal will vary by data set but our starting recommendations are to remove libraries with:
+• sequences < 1,000,000 
+• CV coverage > 1
+• alignment < 75%
+
+```{r Filter poor-quality libraries}
+seq_cutoff <- 1E6 
+cv_cutoff <- .75
+align_cutoff <- 75
+
+## This doesn't realy work. Ask Kim about this. Moving on. 
+ggplot(meta, aes(x = reorder(libID, QC_pass), y = QC_pass)) + geom_col() +
+#Add cutoff line
+geom_hline(yintercept = seq_cutoff) +
+#Log scale y-axis
+scale_y_continuous(trans = 'log10',
+                   breaks = trans_breaks("log10", function(x) 10^x),
+                   labels = trans_format("log10", math_format(10^.x))) +
+#Beautify
+theme_classic() +
+labs(x = "Library", y = "Pass-filter sequences (log scale)") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+All of these pass the filter, they look good! 
+
+### Now Set the CV max 
+```{r Set CV max to larget of 1 or max in dataset}
+
+list(colnames(meta))
+
+CV_max <- max(1, max(meta$MEDIAN_CV_COVERAGE))
+
+ggplot(meta, aes(x = MEDIAN_CV_COVERAGE, 
+                   y = mapped/QC_pass*100)) + 
+  geom_point() +
+#Rescale axis limits
+lims(x = c(0,CV_max), y=c(0,100)) +
+  #Add cutoff lines
+geom_hline(yintercept = align_cutoff, lty="dashed") + geom_vline(xintercept = cv_cutoff, lty="dashed") + #Beautify
+theme_classic() +
+labs(x = "Median CV coverage", y="Percent alignment")
+
+
+```
+
+All looks like it is below the 1 cutoff. Good to go forward based on QC library information with out the need to filter. 
+
+```{r }
+
+meta.filter <- meta %>%
+filter(MEDIAN_CV_COVERAGE < cv_cutoff & QC_pass > seq_cutoff &
+mapped/QC_pass*100 > align_cutoff)
+
+
+count.filter <- count %>%
+select(1, all_of(meta.filter$libID))
+
+# this doesn't really edit the files, but is included for future use. 
+
+```
+
+# Filter non-protein coding genes
+```{r Filter non-protein coding genes}
+
+ensembl <- biomaRt::useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl", mirror = "uswest")
+#Format gene key
+key <- biomaRt::getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "mgi_symbol", "gene_biotype", "chromosome_name",
+"start_position", "end_position"), mart=ensembl) %>%
+  #Filter protein coding genes
+  filter(gene_biotype == "protein_coding")
+
+temp <- list(attributes(ensembl))
+key.filter <- key %>%
+#Filter protein coding genes in count table
+  filter(ensembl_gene_id %in% count$Geneid) %>% 
+  #collapse multiannotations. 
+  group_by(ensembl_gene_id, mgi_symbol, gene_biotype,chromosome_name, start_position, end_position) %>% 
+  summarise(entrezgene_id = list(unique(entrezgene_id)), .groups = "drop") %>% 
+  group_by(ensembl_gene_id, entrezgene_id, gene_biotype, chromosome_name, start_position, end_position) %>% 
+  summarise(mgi_symbol = list(unique(mgi_symbol)), .groups = "drop")
+
+#Then, we filter the count table to genes in the protein-coding key.
+# WILL NEED TO GO BACK AND CHNAGE THE count to count filter. 
+count.filter.pc <- count.filter %>% filter(Geneid %in% key.filter$ensembl_gene_id)
+```
+
+##Correct for Batch effects - not necessary for this since on single run. 
+
+#Filter PCA outliers
+
+```{r PCA outliers}
+
+pca3 <- BIGpicture::plot_pca(count.filter.pc, meta= meta, vars="sex", transform_logCPM=TRUE)
+
+pca3
+
+BIGpicture::plot_pca(count.filter.pc, vars = "outlier", meta=meta.filter, transform_logCPM=TRUE,
+outlier_sd = 3, outlier_group = "sex")
+
+
+```
+There are no outliers here! Great quality data. 
+
+We recommend that you initially remove dramatic outliers but leave those that are borderline or questionable. Then, you can re-assess outliers after gene filtering and normalization. You may find that some are no longer outliers after these steps. If they are, you can return to this step and remove them before repeating subsequent steps.
+
+# Create DGEList
+At this stage, we’ve completed sample filtering and can collapse our count and meta data into a single list object. This allows us to shorten our long object names as well as works efficiently with the remaining cleaning steps.
+First, let’s ensure that all the data are in the same order.
+
+```{r CPrepping dat for DGElist}
+
+meta.filter.ord <- meta.filter %>% 
+  arrange(libID)
+
+count.filter.pc.ord <- count.filter.pc %>% 
+  select(1, all_of(meta.filter.ord$libID)) %>% arrange(Geneid) %>% column_to_rownames(var = "Geneid")
+
+#check
+identical(meta.filter.ord$libID, colnames(count.filter.pc.ord))
+
+identical(key.filter$ensembl_gene_id, rownames(count.filter.pc.ord))
+
+
+# this is false because gene is a column. Should I make genes into a row name?
+#count table
+# Note that if you did not do batch correction, you may need to # move gene names from a variable in the df to rownames
+
+```
+
+Now merge data objects
+
+```{r Merge DEGlist object, edgeR format}
+
+dat <- DGEList(counts = as.matrix(count.filter.pc.ord), 
+               #metadata
+samples = meta.filter.ord,
+genes = key.filter)
+
+temp <- dat$counts
+# this is to check row names are the same as the actual ID. 
+```
+
+
+#Filter low abundance genes
+Low abundance (small counts) and rare genes (many 0 counts) are removed from the data because they:
+• are unlikely to be significantly differentially expressed
+• greatly inflate multiple comparison correction
+• often do not meet linear modeling assumptions regarding mean variance trends (e.g. because of small
+N, they show lower variance than what is expected for their mean expression - see plot below)
+
+```{r filter low abundance}
+
+
+BIGpicture::plot_mv(dat, design = "~ group")
+
+#Our goal is to remove genes in the lower left where counts (x) and variance (y) are low e.g. where genes break the mean variance trend. We use our custom function to retain only genes that are at least min.CPM counts per million in at least min.sample number of samples OR in at least min.pct percent of samples. Here, we use 0.5 CPM in at least 3 samples. 
+#Does this mean at least 5 samples since my group sizes are n=4.
+
+dat.abund <- RNAetc::filter_rare(dat, min.CPM = 0., min.sample = 3, gene.var="ensembl_gene_id")
+#Plotting the filtered data, we see the trend line (red) is roughly linear and the lower left tail is mostly removed.
+plot_mv(dat.abund, design = "~ group")
+
+# percent Amount of genes removed:
+length(rownames(dat.abund$counts))
+length(rownames(dat$counts))
+
+#Percent of genes left. 
+length(rownames(dat.abund$counts))/length(rownames(dat$counts))*100
+# With the minCPM cutoff and min.sample = 3, I lose 40% of samples... I think this might be too strict. 
+
+#Okay not try min.CPM = 0.5, min.sample = 5
+dat.abund <- RNAetc::filter_rare(dat, min.CPM = 0.1, min.sample = 3, gene.var="ensembl_gene_id")
+plot_mv(dat.abund, design = "~ group")
+length(rownames(dat.abund$counts))/length(rownames(dat$counts))*100
+length(rownames(dat.abund$counts))
+length(rownames(dat$counts))
+
+
+```
+
+31.02% of genes removed. 
+
+### Create filtered gene list. 
+
+```{r genes that were filtered out , rare}
+
+rare <- as.data.frame(cpm(dat$counts)) %>%
+#Filter genes removed
+rownames_to_column("ensembl_gene_id") %>% filter(!(ensembl_gene_id %in% rownames(dat.abund$counts))) %>% #Add gene symbols
+left_join(dat$genes, by = "ensembl_gene_id") %>%
+#format
+select(-c(chromosome_name:end_position)) %>%
+pivot_longer(-c(ensembl_gene_id, gene_biotype, mgi_symbol, entrezgene_id)) %>% group_by(ensembl_gene_id, gene_biotype, mgi_symbol) %>%
+summarise(mean.CPM = mean(value, na.rm=TRUE), min.CPM = min(value, na.rm=TRUE), max.CPM = max(value, na.rm=TRUE),
+express.in.libs = length(value[value > 0]), .groups="drop")
+
+write_csv(rare, file="data_clean/CD22.05.01_rare_genes2.csv")
+
+```
+
+# Normalize Data
+
+RNA-seq counts are not independent within a library and not comparable across libraries. A library with 1 million sequences will have higher counts for most genes than one with 1 thousand sequences. We correct for this aspect of the data with the following normalization steps.
+
+TMM defines a reference sample from your data set as the one with the most representative expression for the overall data set. Specifically, the reference sample is the one whose upper quartile is closest to the overall data set upper quartile. The upper quantile is the value (x) where 75% of genes have expression < x. Thus,the reference sample is the sample whose x is the closest to mean(x) across all samples.
+
+All other samples are considered test samples. For each test sample, a scaling factor is calculated based on the weighted mean of log ratios of representative genes between the test and reference. These representative genes are a subset of the data set, removing the highest and lowest expressed genes as well as genes with the highest and lowest log ratios. The exact genes used as representative genes for scaling are dynamic and specific to each test sample.
+
+The calculated scaling factors are then applied to the counts table automatically in the voom step.
+
+```{r Normalize}
+
+dat.abund.norm <- calcNormFactors(dat.abund, method = "TMM")
+
+```
+
+## voom aka log2 counts per million (CPM)
+
+We continue normalization by converting counts to CPM within each sample, thus accounting for differential sampling depth. We also perform log2 transformation, because RNA-seq data are heavily right-skewed and thus, violate assumptions of normality.
+
+```{r voom CPM}
+
+as.data.frame(dat.abund$counts) %>% rownames_to_column() %>% pivot_longer(-rowname) %>%
+ggplot() +
+  geom_histogram(aes(x=value), bins = 100) + theme_classic() +
+  labs(x = "count", y = "occurences") + lims(x=c(0,1000))
+
+
+dat.abund.norm.voom <- voomWithQualityWeights(dat.abund.norm,
+                                               design=model.matrix(~ group,
+                                                data=dat.abund.norm$samples),
+                                               plot=TRUE)
+
+```
+
+voom performs both of these steps! We use voom WithQualityWeights to additionally calculate sample specific quality weights that can be of use as co-variates in linear modeling.
+
+# PCA 
+
+```{r PCA}
+
+plot_pca(dat.abund.norm.voom, vars = c("group","ID","sex","group","time","organ_quality", "vaccine")) %>% wrap_plots(ncol=2)
+
+#I can't figure out how to make ID a factor. Now converting.
+
+ggsave("figs/pca_all.png", width = 10, height =10)
+
+plot_pca(dat.abund.norm.voom, PCx = 2,
+  PCy = 3, vars = c("group","ID","sex","group","time","organ_quality", "vaccine")) %>% wrap_plots(ncol=2)
+ggsave("figs/pca_3_all.png", width = 10, height =10)
+
+```
+
+# Save Data
+```{r echo = FALSE}
+
+save(dat.abund.norm, file = "data_clean/CD22.05.01_dat.RData") 
+save(dat.abund.norm.voom, file = "data_clean/CD22.05.01_voom.RData")
+
+as.data.frame(dat.abund.norm$counts) %>% rownames_to_column("ensembl_gene_id") %>% write_csv("data_clean/CD22.05.01_counts.csv")
+as.data.frame(dat.abund.norm.voom$E) %>% rownames_to_column("ensembl_gene_id") %>% write_csv("data_clean/CD22.05.01_counts_voom.csv")
+
+```
+

@@ -1,0 +1,212 @@
+---
+title: "Voom_to_DEG_Acute(44hpi)"
+author: "Caroline_Duncombe"
+date: '2022-05-05'
+output: html_document
+---
+
+# Calculate DEGs form the Voom object produced in previous code strip. 
+
+Create output data files of final comparisons for output plots.
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include = FALSE}
+
+library(limma)
+library(edgeR)
+library(patchwork)
+library(Biobase)
+library(edgeR)
+library(limma)
+library(Glimma)
+library(tidyverse)
+library(ggplot2)
+library(gplots)
+library(pheatmap)
+library(EnhancedVolcano) # will need to cite if I use this. 
+library(ComplexHeatmap)
+library(tidyverse)
+library(openxlsx)
+
+```
+
+#Load Data
+```{r Load data and subset}
+
+rm(list = ls())
+load("data_clean/Voom_outputs/CD22.05.01_voom.RData") 
+
+```
+
+```{r Subset to Acute timepoint}
+
+dat <- dat.abund.norm.voom[,which(dat.abund.norm.voom$targets$timepoint == "acute" | dat.abund.norm.voom$targets$timepoint == "mock")]
+
+```
+
+## Step 1:
+### Create Contrast Matrix
+
+```{r Contrasts Step 1}
+dat$targets <- dat$targets %>% mutate(vax = factor(vaccine, levels = c("mock", "RAS", "gg_RAS"))) 
+dat$targets <- dat$targets %>% mutate(sex_vax = paste(sex, vax, sep = "_")) # create new term to separate by. 
+design <- model.matrix(~0 + sex_vax, data = dat$targets)
+design
+
+contrasts <- makeContrasts(sex_vaxF_gg_RAS - sex_vaxF_mock,
+                           sex_vaxM_gg_RAS - sex_vaxM_mock,
+                           sex_vaxF_RAS - sex_vaxF_mock,
+                           sex_vaxM_RAS - sex_vaxM_mock,
+                           sex_vaxF_mock - sex_vaxM_mock,
+                           levels=design)
+
+fit <- lmFit(dat, design)
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+fit2
+```
+
+## Step 2
+
+### Create Data frame of Top Tables with FDR < .05 for down stream Gene Enrichment Analysis
+
+```{r FDR cutoff and TopTable - for GENE EXPRESSION}
+# Create top tables
+F_ggRAS <- topTable(fit2, coef="sex_vaxF_gg_RAS - sex_vaxF_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "F_ggRAS")
+M_ggRAS <- topTable(fit2, coef="sex_vaxM_gg_RAS - sex_vaxM_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "M_ggRAS")
+F_RAS <- topTable(fit2, coef="sex_vaxF_RAS - sex_vaxF_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "F_RAS")
+M_RAS <- topTable(fit2, coef="sex_vaxM_RAS - sex_vaxM_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "M_RAS") 
+# Now combine the top tables from vaccination groups. 
+top_list <- rbind(F_ggRAS, M_ggRAS) 
+top_list <- rbind(top_list, F_RAS) 
+top_list <- rbind(top_list, M_RAS) 
+
+```
+
+## Step 3
+
+### Now filter out genes that are unique shared with mock baselines
+
+```{r - Filter out Combined genes - for GENE EXPRESSION}
+#Weird that it didn't recognize the other way to input the coef. 
+FM_mock <- topTable(fit2, coef=5,  p.value = .05, number = Inf) %>% add_column(dat_source = "FM_mock") %>% select(c("mgi_symbol","ensembl_gene_id"))
+top_list_filter <- anti_join(top_list, FM_mock, by = "mgi_symbol")
+
+#Check the filtered gene lists.
+
+table(top_list$dat_source)
+table(top_list_filter$dat_source)
+
+```
+
+#Create exportable files of Top Tables
+```{r Create Exportable Final DEGs}
+
+tab_top <- topTable(fit2, coef="sex_vaxF_gg_RAS - sex_vaxF_mock", number = Inf, p.value = 0.05, lfc = 1) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab1 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxM_gg_RAS - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab2 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxF_RAS - sex_vaxF_mock", number = Inf, p.value = 0.05, lfc = 1) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab3 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxM_RAS - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab4 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxF_mock - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab5 <- tab_top
+
+```
+
+# Export model fit for other analysis
+```{r Export Linear Model and Top DEG list for GSEA}
+
+save(fit2, file = "data_clean/DEG_outputs/fit2_acute.RData")
+save(top_list_filter, file = "data_clean/DEG_outputs/top_list_filter_acute.RData")
+
+```
+
+#Repeat for Day 6 Timepoint
+```{r Day 6 Timepoint}
+
+#Filter data
+dat <- dat.abund.norm.voom[,which(dat.abund.norm.voom$targets$timepoint == "adaptive" | dat.abund.norm.voom$targets$timepoint == "mock")]
+
+#Linear Model
+dat$targets <- dat$targets %>% mutate(vax = factor(vaccine, levels = c("mock", "RAS", "gg_RAS"))) 
+dat$targets <- dat$targets %>% mutate(sex_vax = paste(sex, vax, sep = "_")) # create new term to separate by. 
+design <- model.matrix(~0 + sex_vax, data = dat$targets)
+design
+
+contrasts <- makeContrasts(sex_vaxF_gg_RAS - sex_vaxF_mock,
+                           sex_vaxM_gg_RAS - sex_vaxM_mock,
+                           sex_vaxF_RAS - sex_vaxF_mock,
+                           sex_vaxM_RAS - sex_vaxM_mock,
+                           sex_vaxF_mock - sex_vaxM_mock,
+                           levels=design)
+
+fit <- lmFit(dat, design)
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+fit2
+
+# Create top tables
+# Create top tables
+F_ggRAS <- topTable(fit2, coef="sex_vaxF_gg_RAS - sex_vaxF_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "F_ggRAS")
+M_ggRAS <- topTable(fit2, coef="sex_vaxM_gg_RAS - sex_vaxM_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "M_ggRAS")
+F_RAS <- topTable(fit2, coef="sex_vaxF_RAS - sex_vaxF_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "F_RAS")
+M_RAS <- topTable(fit2, coef="sex_vaxM_RAS - sex_vaxM_mock",  p.value = .05, number = Inf) %>% add_column(dat_source = "M_RAS") 
+# Now combine the top tables from vaccination groups. 
+top_list <- rbind(F_ggRAS, M_ggRAS) 
+top_list <- rbind(top_list, F_RAS) 
+top_list <- rbind(top_list, M_RAS) 
+
+#Weird that it didn't recognize the other way to input the coef. 
+FM_mock <- topTable(fit2, coef=5,  p.value = .05, number = Inf) %>% add_column(dat_source = "FM_mock") %>% select(c("mgi_symbol","ensembl_gene_id"))
+top_list_filter <- anti_join(top_list, FM_mock, by = "mgi_symbol")
+
+#Check the filtered gene lists.
+
+table(top_list$dat_source)
+table(top_list_filter$dat_source)
+
+# Maybe should also check that the genes we filtered were shared. 
+
+check <- semi_join(top_list, FM_mock, by = "mgi_symbol")
+#The gene did appear in both data sets. 
+
+
+save(fit2, file = "data_clean/DEG_outputs/fit2_adapt.RData")
+save(top_list_filter, file = "data_clean/DEG_outputs/top_list_filter_adapt.RData")
+
+```
+
+#Create Final TopTable.
+```{r}
+tab_top <- topTable(fit2, coef="sex_vaxF_gg_RAS - sex_vaxF_mock", number = Inf, p.value = 0.05, lfc = 1.5) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab6 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxM_gg_RAS - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1.5) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab7 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxF_RAS - sex_vaxF_mock", number = Inf, p.value = 0.05, lfc = 1.5) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab8 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxM_RAS - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1.5) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab9 <- tab_top
+tab_top <- topTable(fit2, coef="sex_vaxF_mock - sex_vaxM_mock", number = Inf, p.value = 0.05, lfc = 1.5) %>% rownames_to_column() %>% select(c("mgi_symbol", "ensembl_gene_id", "adj.P.Val","logFC","P.Value","chromosome_name"))
+tab10 <- tab_top
+
+dataset_names <- list('Acute_F_ggRAS-F_mock' = tab1,
+                      'Acute_M_ggRAS-M_mock' = tab2,
+                      'Acute_F_RAS-F_mock' = tab3,
+                      'Acute_M_RAS-M_mock'= tab4,
+                      'Acute_F_mock-M_mock'= tab5,
+                      'Adaptive_F_gg_RAS-F_mock' = tab6,
+                      'Adaptive_M_gg_RAS-M_mock' = tab7,
+                      'Adaptive_F_RAS-F_mock' = tab8,
+                      'Adaptive_M_RAS-M_mock'= tab9,
+                      'Adaptive_F_mock-M_mock'= tab10
+                      )
+
+openxlsx::write.xlsx(dataset_names, file = 'results/gene_expression/DEGs_list_logFC1.5.xlsx')
+```
+
